@@ -16,9 +16,11 @@ class CausalSelfAttention(nn.Module):
         # key, query, value projections for all heads, but in a batch
         self.in_embed = in_embed if in_embed is not None else config.n_embd
 
-        self.c_attn = nn.Linear(self.in_embed, 3 * self.in_embed)
+        self.c_attn_k = nn.Linear(self.in_embed, self.in_embed)
+        self.c_attn_q = nn.Linear(self.in_embed, self.in_embed)
+        self.c_attn_v = nn.Linear(config.n_embd, config.n_embd)
         # output projection
-        self.c_proj = nn.Linear(self.in_embed, config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
@@ -37,15 +39,21 @@ class CausalSelfAttention(nn.Module):
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
         assert C == self.in_embed, "input must match embedding dim"
-        qkv = self.c_attn(x)
-        # print(qkv.shape)
-        q, k, v = qkv.split(self.in_embed, dim=2)
+        q = self.c_attn_q(x)
+        k = self.c_attn_k(x)
+
+        # v is only applied on the first embeddings
+        xv = x[:,:,:self.n_embd]
+
+        v = self.c_attn_v(xv)
+
         # print(k.shape, q.shape, v.shape)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # y = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0, is_causal=True) # flash attention
+        v = v.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0, is_causal=True) # flash attention
         
+        """
         # print(k.shape, q.shape, v.shape)
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -55,8 +63,10 @@ class CausalSelfAttention(nn.Module):
         att = self.attn_dropout(att)
         # print(att.shape)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # print(y.shape)
+        """
         
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, self.n_embd) # re-assemble all head outputs side by side
         # print(x.shape, y.shape)
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -81,20 +91,27 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, in_embed = None):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config, in_embed=config.n_embd * 2)
+        self.in_embed = in_embed if in_embed is not None else config.n_embd
+        self.ln_1 = nn.LayerNorm(self.in_embed)
+        self.attn = CausalSelfAttention(config, in_embed=self.in_embed)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        ln1 = self.ln_1(x)
-        # print("ln", ln1.shape)
-        att_in = torch.cat((ln1, ln1), dim=-1)
-        # print("lno", att_in.shape)
-        x = x + self.attn(att_in)
+        x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
+        return x
+    
+class ConvBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.block = Block(config, in_embed=config.n_embd)
+
+    def forward(self, x):
+        x = self.block(x)
         return x
 
 @dataclass
@@ -116,7 +133,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([ConvBlock(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -310,7 +327,7 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(block_size=256, vocab_size=vocab_size, n_layer=6, n_head=6, n_embd=96, dropout=0.20))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
-use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
 if ddp:
