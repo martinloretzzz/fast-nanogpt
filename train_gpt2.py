@@ -201,12 +201,20 @@ class GPT(nn.Module):
         return optimizer
 
 # -----------------------------------------------------------------------------
-import tiktoken
+import requests
 import numpy as np
 
+data_url = 'https://gist.githubusercontent.com/blakesanie/dde3a2b7e698f52f389532b4b52bc254/raw/76fe1b5e9efcf0d2afdfd78b0bfaa737ad0a67d3/shakespeare.txt'
+# data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
+
 # download the tiny shakespeare dataset
-with open(os.path.join(os.path.abspath(''), 'input.txt'), 'r') as f:
-    data = f.read().replace("$", "") # reduce token count to 64
+input_file_path = os.path.join(os.path.abspath(''), 'input.txt')
+if not os.path.exists(input_file_path):
+    with open(input_file_path, 'w') as f:
+        f.write(requests.get(data_url).text)
+
+with open(input_file_path, 'r') as f:
+    data = f.read()
 print(f"length of dataset in characters: {len(data):,}")
 
 # get all the unique characters that occur in this text
@@ -218,6 +226,7 @@ print(f"vocab size: {vocab_size:,}")
 # create a mapping from characters to integers
 stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
+
 def encode(s):
     return [stoi[c] for c in s] # encoder: take a string, output a list of integers
 def decode(l):
@@ -241,24 +250,18 @@ val_ids = torch.tensor(np.array(val_ids, dtype=np.uint16).astype(np.int32), dtyp
 
 class ShakespeareDataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split):
-        self.B = B
-        self.T = T
+        self.B, self.T = B, T
         assert split in {'train', 'val'}
-
         self.data = train_ids if split == 'train' else val_ids
-        self.reset()
 
     def reset(self):
-        self.curr = 0
+        pass
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.data[self.curr : self.curr+B*T+1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        self.curr += B * T
-        if self.curr + (B * T + 1) > len(self.data):
-            self.reset()
+        ix = torch.randint(len(self.data) - T, (B,))
+        x = torch.stack([self.data[i:i+T] for i in ix])
+        y = torch.stack([self.data[i+1:i+1+T] for i in ix])
         return x, y
 
 # -----------------------------------------------------------------------------
