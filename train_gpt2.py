@@ -22,6 +22,9 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
+        self.dropout = config.dropout
+        self.resid_dropout = nn.Dropout(config.dropout)
+
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -32,10 +35,10 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        y = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0, is_causal=True) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
-        y = self.c_proj(y)
+        y = self.resid_dropout(self.c_proj(y))
         return y
 
 class MLP(nn.Module):
@@ -46,11 +49,13 @@ class MLP(nn.Module):
         self.gelu    = nn.GELU(approximate='tanh')
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
+        x = self.dropout(x)
         return x
 
 class Block(nn.Module):
@@ -74,6 +79,7 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
+    dropout: int = 0
 
 class GPT(nn.Module):
 
@@ -84,6 +90,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
@@ -114,7 +121,7 @@ class GPT(nn.Module):
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
-        x = tok_emb + pos_emb
+        x = self.transformer.drop(tok_emb + pos_emb)
         # forward the blocks of the transformer
         for block in self.transformer.h:
             x = block(x)
@@ -204,8 +211,8 @@ class GPT(nn.Module):
 import requests
 import numpy as np
 
-data_url = 'https://gist.githubusercontent.com/blakesanie/dde3a2b7e698f52f389532b4b52bc254/raw/76fe1b5e9efcf0d2afdfd78b0bfaa737ad0a67d3/shakespeare.txt'
-# data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
+# data_url = 'https://gist.githubusercontent.com/blakesanie/dde3a2b7e698f52f389532b4b52bc254/raw/76fe1b5e9efcf0d2afdfd78b0bfaa737ad0a67d3/shakespeare.txt'
+data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
 
 # download the tiny shakespeare dataset
 input_file_path = os.path.join(os.path.abspath(''), 'input.txt')
@@ -325,10 +332,10 @@ val_loader = ShakespeareDataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_proc
 torch.set_float32_matmul_precision('high')
 
 # create model
-model = GPT(GPTConfig(block_size=256, vocab_size=vocab_size, n_layer=6, n_head=6, n_embd=384))
+model = GPT(GPTConfig(block_size=256, vocab_size=vocab_size, n_layer=6, n_head=6, n_embd=384, dropout=0.10))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
-use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
 if ddp:
@@ -342,7 +349,7 @@ max_steps = 2000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch siz
 
 beta2 = 0.99
 
-log_steps = 50
+log_steps = 100
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -405,11 +412,11 @@ for step in range(max_steps):
                 torch.save(checkpoint, checkpoint_path)
 
     # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % log_steps == 0) or last_step) and (not use_compile):
+    if ((step > 0 and step % log_steps == 0) or last_step):
         model.eval()
         num_return_sequences = 4
-        max_length = 32
-        tokens = encode("MENENIUS:\nEither you ")
+        max_length = 64
+        tokens = encode("\n")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
@@ -438,7 +445,7 @@ for step in range(max_steps):
         for i in range(num_return_sequences):
             tokens = xgen[i, :max_length].tolist()
             decoded = decode(tokens)
-            print(f"rank {ddp_rank} sample {i}: {decoded}")
+            print(decoded)
 
     # do one step of the optimization
     model.train()
