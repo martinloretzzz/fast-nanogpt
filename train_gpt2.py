@@ -30,8 +30,8 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                .view(1, 1, config.block_size, config.block_size))
+        # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+        #        .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -106,13 +106,30 @@ class Block(nn.Module):
     
 class ConvBlock(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, block_size):
         super().__init__()
+        self.block_size = block_size
         self.block = Block(config, in_embed=config.n_embd)
 
-    def forward(self, x):
+    def forward_foldable(self, x):
+        B, T, C = x.size()
+        x = x.unfold(1, self.block_size, self.block_size).transpose(2, 3)
+        x = x.view(B * self.block_size, T // self.block_size, C)
         x = self.block(x)
+        x = x.view(B, T, C)
         return x
+
+    def forward(self, x):
+        B, T, C = x.size()
+        if T % self.block_size == 0: return self.forward_foldable(x)
+
+        rem_count = T % self.block_size
+        x_rem, x_fold = x[:,0:rem_count,:], x[:,rem_count:,:]
+
+        x_rem = self.block(x_rem)
+        x_fold = self.forward_foldable(x_fold) if T - rem_count > 0 else x_fold
+
+        return torch.cat((x_rem, x_fold), dim=1)
 
 @dataclass
 class GPTConfig:
@@ -133,7 +150,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([ConvBlock(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([ConvBlock(config, block_size=64) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
