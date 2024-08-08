@@ -10,15 +10,11 @@ from torch.nn import functional as F
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config, in_embed = None):
+    def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.in_embed = in_embed if in_embed is not None else config.n_embd
-
-        self.c_attn_k = nn.Linear(self.in_embed, self.in_embed)
-        self.c_attn_q = nn.Linear(self.in_embed, self.in_embed)
-        self.c_attn_v = nn.Linear(config.n_embd, config.n_embd)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
@@ -27,47 +23,20 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
 
         self.dropout = config.dropout
-        self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-
-        # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-        #        .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        assert C == self.in_embed, "input must match embedding dim"
-        q = self.c_attn_q(x)
-        k = self.c_attn_k(x)
-
-        # v is only applied on the first embeddings
-        xv = x[:,:,:self.n_embd]
-
-        v = self.c_attn_v(xv)
-
-        # print(k.shape, q.shape, v.shape)
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         y = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0, is_causal=True) # flash attention
-        
-        """
-        # print(k.shape, q.shape, v.shape)
-
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        # print(att.shape)
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        # print(att.shape)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        # print(y.shape)
-        """
-        
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_embd) # re-assemble all head outputs side by side
-        # print(x.shape, y.shape)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
@@ -91,11 +60,10 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, in_embed = None):
+    def __init__(self, config):
         super().__init__()
-        self.in_embed = in_embed if in_embed is not None else config.n_embd
-        self.ln_1 = nn.LayerNorm(self.in_embed)
-        self.attn = CausalSelfAttention(config, in_embed=self.in_embed)
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
